@@ -39,6 +39,8 @@ python server.py
 
 Nothing prints, and it doesn't return. It is waiting on stdin for a host to speak first.
 
+Stopping is the host's job too: it closes your stdin, and the server returns when the pipe ends. A server that has to stop on its own while the host still holds the pipe open (a failing background task, a signal handler cancelling its tasks) returns as well when its stdin is a pipe or a socket on POSIX; on Windows, where AnyIO readiness waits do not support pipe descriptors, that read waits for the host's next line or for the pipe to close.
+
 That also means stdout **is the wire**. While serving, the SDK moves the wire to a private descriptor and diverts output that is *flushed* to stdout (a subprocess writing to its inherited stdout, a flushed `print()`) to stderr, where it can't corrupt the stream. Output flushed to stdout *before* serving begins (a wrapper script echoing, an unbuffered import-time print) still lands on the wire, and so does a `print()` that stays buffered until the interpreter drains it at exit. For output you actually want, the `logging` module is the right tool: its handler flushes each record to stderr as it happens. That story is in **[Logging](../handlers/logging.md)**.
 
 ### Try it

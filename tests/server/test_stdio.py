@@ -6,6 +6,7 @@ import threading
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from io import TextIOWrapper
+from pathlib import Path
 
 import anyio
 import anyio.to_thread
@@ -23,7 +24,7 @@ from mcp_types import (
 from typing_extensions import Buffer
 
 from mcp.server.mcpserver import MCPServer
-from mcp.server.stdio import stdio_server
+from mcp.server.stdio import _supports_readiness, _wire_lines, stdio_server
 from mcp.shared.message import SessionMessage
 
 
@@ -211,6 +212,165 @@ async def test_stdio_server_takes_stdin_off_the_descriptor_table_while_serving(
             stdout_double.close()
             os.close(out_r)
             os.close(out_w)
+
+
+@contextmanager
+def _file_planted_on_fd0(path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Like _pipe_planted_on_fd0 but plants an open regular file (or device) on fd 0."""
+    real_dup2 = os.dup2
+    file_fd = os.open(path, os.O_RDONLY)
+    saved0 = os.dup(0)
+    os.dup2(file_fd, 0)
+    stdin_double = TextIOWrapper(open(0, "rb", closefd=False), encoding="utf-8")
+    try:
+        monkeypatch.setattr(sys, "stdin", stdin_double)
+        yield
+    finally:
+        stdin_double.close()
+        real_dup2(saved0, 0)
+        os.close(saved0)
+        os.close(file_fd)
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(sys.platform == "win32", reason="pipes are read on the event loop on POSIX only")
+@pytest.mark.parametrize("initially_blocking", [True, False])
+async def test_stdio_server_exits_on_cancellation_with_stdin_held_open(  # pragma: lax no cover - POSIX-only
+    initially_blocking: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancelling the transport returns although no further stdin line or EOF ever arrives.
+
+    SDK-defined behavior: on POSIX the wire is read on the event loop, so a transport stopped
+    by a signal or by a failing sibling task exits while the client still holds the pipe open,
+    and the descriptor's blocking mode is back to what it was (an alias shares that flag).
+    """
+    with _pipe_planted_on_fd0(monkeypatch) as (in_r, in_w):
+        monkeypatch.setattr(sys, "stdout", TextIOWrapper(io.BytesIO(), encoding="utf-8"))
+        os.set_blocking(in_r, initially_blocking)
+        try:
+
+            async def serve() -> None:
+                async with stdio_server() as (read_stream, write_stream):
+                    async with read_stream, write_stream:
+                        await anyio.sleep_forever()
+
+            with anyio.fail_after(5):
+                async with anyio.create_task_group() as tg:
+                    tg.start_soon(serve)
+                    # One frame is read and sits undelivered (nobody receives), so the
+                    # cancellation lands while a line is being delivered, not only while
+                    # the loop waits for one.
+                    os.write(in_w, _frame(JSONRPCRequest(jsonrpc="2.0", id=1, method="ping")))
+                    await anyio.wait_all_tasks_blocked()
+                    tg.cancel_scope.cancel()
+
+            assert os.path.sameopenfile(0, in_r)
+            assert os.get_blocking(in_r) is initially_blocking
+        finally:
+            os.close(in_w)
+
+
+_CANCELLED_SERVER = """
+import os, sys
+import anyio
+from mcp.server.stdio import stdio_server
+
+wire = os.fstat(0)
+
+async def main() -> None:
+    async with anyio.create_task_group() as tg:
+        async def serve() -> None:
+            async with stdio_server() as (read_stream, write_stream):
+                async with read_stream, write_stream:
+                    await anyio.sleep_forever()
+        tg.start_soon(serve)
+        await anyio.wait_all_tasks_blocked()
+        tg.cancel_scope.cancel()
+
+anyio.run(main)
+after = os.fstat(0)
+sys.exit(0 if (after.st_dev, after.st_ino) == (wire.st_dev, wire.st_ino) else 3)
+"""
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(sys.platform == "win32", reason="pipes are read on the event loop on POSIX only")
+async def test_a_server_cancelled_while_the_client_holds_stdin_open_exits_the_process() -> (
+    None
+):  # pragma: lax no cover - POSIX-only
+    """The whole process ends, not only the transport: no thread is left blocked on the wire.
+
+    SDK-defined behavior: a server that stops on its own while the client still holds the
+    pipe open exits without the client's help, with fd 0 back on the wire.
+    """
+    with anyio.fail_after(30):
+        async with await anyio.open_process([sys.executable, "-c", _CANCELLED_SERVER]) as process:
+            # stdin stays open: the server gets neither a line nor EOF before it exits.
+            returncode = await process.wait()
+    assert returncode == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(sys.platform == "win32", reason="pipes are read on the event loop on POSIX only")
+async def test_the_loop_reader_frames_lines_like_the_text_wrapper() -> None:  # pragma: lax no cover - POSIX-only
+    """Lines split across reads, a multibyte character split across reads, CRLF (also split
+    across reads), bare CR, an invalid byte and a line ended only by EOF (with a trailing CR)
+    come out as the worker-thread text wrapper produced them: UTF-8 with replacement,
+    universal newlines translated to a newline."""
+    in_r, in_w = os.pipe()
+    writer_open = True
+    lines: list[str] = []
+    try:
+        with anyio.fail_after(5):
+            async with anyio.create_task_group() as tg:
+
+                async def collect() -> None:
+                    lines.extend([line async for line in _wire_lines(in_r)])
+
+                tg.start_soon(collect)
+                for chunk in (b'{"a":1}\r', b'\n{"b":"\xc3', b'\xa9"}\n{"c":2}\rtail\xff\r'):
+                    os.write(in_w, chunk)
+                    await anyio.wait_all_tasks_blocked()
+                os.close(in_w)
+                writer_open = False
+        assert lines == ['{"a":1}\n', '{"b":"\u00e9"}\n', '{"c":2}\n', "tail\ufffd\n"]
+        assert os.get_blocking(in_r)
+    finally:
+        if writer_open:
+            os.close(in_w)
+        os.close(in_r)
+
+
+@pytest.mark.anyio
+async def test_stdio_server_reads_a_regular_file_and_the_null_device_on_stdin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """stdin redirected from a file or the null device is still served, through the worker-thread read.
+
+    SDK-defined behavior: only pipes and sockets are read on the event loop (a regular file or
+    the null device cannot be waited on under Linux epoll); other descriptors keep readline.
+    """
+    assert not _supports_readiness(-1)  # a descriptor that cannot be inspected is not waited on either
+
+    request = JSONRPCRequest(jsonrpc="2.0", id=1, method="ping")
+    script = tmp_path / "input.jsonl"
+    script.write_bytes(_frame(request))
+    monkeypatch.setattr(sys, "stdout", TextIOWrapper(io.BytesIO(), encoding="utf-8"))
+
+    with _file_planted_on_fd0(script, monkeypatch), anyio.fail_after(5):
+        async with stdio_server() as (read_stream, write_stream):
+            async with read_stream:  # pragma: no branch
+                received = await read_stream.receive()
+                assert isinstance(received, SessionMessage)
+                assert received.message == request
+                await write_stream.aclose()
+
+    with _file_planted_on_fd0(Path(os.devnull), monkeypatch), anyio.fail_after(5):
+        async with stdio_server() as (read_stream, write_stream):
+            async with read_stream:  # pragma: no branch
+                with pytest.raises(anyio.EndOfStream):
+                    await read_stream.receive()
+                await write_stream.aclose()
 
 
 @pytest.mark.anyio
