@@ -11,11 +11,14 @@ Example:
     ```
 """
 
+import codecs
+import io
 import os
+import stat
 import sys
 import threading
-from collections.abc import Callable
-from contextlib import asynccontextmanager, suppress
+from collections.abc import AsyncGenerator, AsyncIterable, Callable
+from contextlib import aclosing, asynccontextmanager, suppress
 from dataclasses import dataclass
 from io import TextIOWrapper
 from typing import BinaryIO, Literal, TextIO
@@ -105,17 +108,18 @@ def _restore_fd(fd: int, private_fd: int) -> bool:
 
 def _claim_fd(
     fd: int, stream: TextIO, mode: Literal["rb", "wb"], open_diversion: Callable[[], int]
-) -> tuple[BinaryIO, Callable[[], None] | None]:
+) -> tuple[BinaryIO, Callable[[], None] | None, int | None]:
     """Claim a standard stream: divert fd and serve the wire from a private duplicate.
 
     Best-effort: when descriptors cannot be duplicated or diverted, serves the
-    sys stream's buffer in place, exactly as v1 did, with the claim held.
+    sys stream's buffer in place, exactly as v1 did, with the claim held. The
+    third item is the private duplicate's descriptor, None when serving in place.
 
     Raises:
         RuntimeError: fd is already claimed by another transport in this process.
     """
     if not _is_backed_by_fd(stream, fd):
-        return stream.buffer, None
+        return stream.buffer, None, None
     claim = _StreamClaim(fd)
     with _claims_lock:
         if fd in _claims:
@@ -130,13 +134,13 @@ def _claim_fd(
     try:
         private_fd = _dup_above_std(fd)
     except OSError:
-        return stream.buffer, release
+        return stream.buffer, release, None
     claim.private_fd = private_fd
 
     try:
         diversion_fd = open_diversion()
     except OSError:
-        return stream.buffer, release
+        return stream.buffer, release, None
     try:
         os.dup2(diversion_fd, fd)
     except OSError:
@@ -146,7 +150,7 @@ def _claim_fd(
         with suppress(OSError):
             os.close(diversion_fd)
         _restore_fd(fd, private_fd)
-        return stream.buffer, release
+        return stream.buffer, release, None
     with suppress(OSError):
         os.close(diversion_fd)
     if sys.platform == "win32":  # pragma: no cover
@@ -155,7 +159,58 @@ def _claim_fd(
 
     # closefd=False: a worker thread can still block on this descriptor after
     # the transport exits, so it must never be closed and recycled under it.
-    return os.fdopen(private_fd, mode, closefd=False), release
+    return os.fdopen(private_fd, mode, closefd=False), release, private_fd
+
+
+def _supports_readiness(fd: int) -> bool:
+    """Whether fd is a pipe or a socket: a descriptor the event loop can wait on for input.
+
+    A regular file or the null device is always "ready" or refuses registration
+    outright (Linux epoll), so those keep the worker-thread read.
+    """
+    try:
+        mode = os.fstat(fd).st_mode
+    except OSError:
+        return False
+    return stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode)
+
+
+async def _wire_lines(
+    fd: int,
+) -> AsyncGenerator[str, None]:  # pragma: lax no cover - POSIX-only, uncovered on Windows runners
+    """The wire's lines, read on the event loop so that cancellation never waits on a thread.
+
+    A blocking readline on a pipe cannot be interrupted, and the worker thread it runs on
+    is not a daemon thread: a transport cancelled while the client still holds stdin open
+    (a failing sibling task, a signal) would neither exit nor let the interpreter exit.
+    The private duplicate is read in non-blocking mode instead, its original mode restored
+    on exit (duplicates share file-status flags). Decoding matches the text wrapper of the
+    worker-thread path: UTF-8 with replacement, universal newlines translated to "\\n".
+    """
+    was_blocking = os.get_blocking(fd)
+    os.set_blocking(fd, False)
+    try:
+        decode = codecs.getincrementaldecoder("utf-8")(errors="replace").decode
+        newlines = io.IncrementalNewlineDecoder(decoder=None, translate=True)
+        pending = ""
+        while True:
+            await anyio.wait_readable(fd)
+            try:
+                chunk = os.read(fd, 65536)
+            except BlockingIOError:
+                continue
+            final = not chunk
+            pending += newlines.decode(decode(chunk, final), final)
+            while (end := pending.find("\n")) != -1:
+                yield pending[: end + 1]
+                pending = pending[end + 1 :]
+            if final:
+                if pending:
+                    yield pending
+                return
+    finally:
+        with suppress(OSError):
+            os.set_blocking(fd, was_blocking)
 
 
 @asynccontextmanager
@@ -166,34 +221,55 @@ async def stdio_server(stdin: anyio.AsyncFile[str] | None = None, stdout: anyio.
     and children read EOF and their stray output misses the wire; both descriptors
     are restored on exit. Explicit streams skip the claim, and a second concurrent
     stdio_server() raises RuntimeError.
+
+    A pending stdin read is cancellable when the claimed stream is a POSIX pipe or
+    socket: it is read on the event loop. On Windows (AnyIO readiness waits do not
+    support pipe descriptors), for explicit streams, and when the claim had to fall
+    back to reading sys.stdin in place, a pending read still waits for the next line
+    or EOF.
     """
     # Re-wrap the binary buffers as UTF-8 text; the std handles' platform encodings are unreliable.
     restore_stdin: Callable[[], None] | None = None
     restore_stdout: Callable[[], None] | None = None
+    wire_fd: int | None = None
     try:
         if not stdin:
-            stdin_buffer, restore_stdin = _claim_fd(0, sys.stdin, "rb", _open_stdin_diversion)
+            stdin_buffer, restore_stdin, private_fd = _claim_fd(0, sys.stdin, "rb", _open_stdin_diversion)
             stdin = anyio.wrap_file(_UnownedTextWrapper(stdin_buffer, encoding="utf-8", errors="replace"))
+            # AnyIO readiness waits do not support Windows pipe descriptors: there the
+            # read stays in a worker thread.
+            loop_readable = private_fd is not None and _supports_readiness(private_fd)
+            if (
+                loop_readable and sys.platform != "win32"
+            ):  # pragma: lax no cover - POSIX-only, uncovered on Windows runners
+                wire_fd = private_fd
         if not stdout:
-            stdout_buffer, restore_stdout = _claim_fd(1, sys.stdout, "wb", _open_stdout_diversion)
+            stdout_buffer, restore_stdout, _ = _claim_fd(1, sys.stdout, "wb", _open_stdout_diversion)
             stdout = anyio.wrap_file(_UnownedTextWrapper(stdout_buffer, encoding="utf-8"))
 
         read_stream_writer, read_stream = create_context_streams[SessionMessage | Exception](0)
         write_stream, write_stream_reader = create_context_streams[SessionMessage](0)
 
+        async def deliver(lines: AsyncIterable[str]) -> None:
+            async for line in lines:
+                try:
+                    message = types.jsonrpc_message_adapter.validate_json(line, by_name=False)
+                except Exception as exc:
+                    await read_stream_writer.send(exc)
+                    continue
+
+                session_message = SessionMessage(message)
+                await read_stream_writer.send(session_message)
+
         async def stdin_reader():
             try:
                 async with read_stream_writer:
-                    async for line in stdin:
-                        try:
-                            message = types.jsonrpc_message_adapter.validate_json(line, by_name=False)
-                        except Exception as exc:
-                            await read_stream_writer.send(exc)
-                            continue
-
-                        session_message = SessionMessage(message)
-                        await read_stream_writer.send(session_message)
-            except anyio.ClosedResourceError:  # pragma: no cover
+                    if wire_fd is not None:  # pragma: lax no cover - POSIX-only, uncovered on Windows runners
+                        async with aclosing(_wire_lines(wire_fd)) as lines:
+                            await deliver(lines)
+                    else:
+                        await deliver(stdin)
+            except anyio.ClosedResourceError:  # pragma: lax no cover - hit by any passing exception on POSIX
                 await anyio.lowlevel.checkpoint()
 
         async def stdout_writer():
@@ -203,7 +279,7 @@ async def stdio_server(stdin: anyio.AsyncFile[str] | None = None, stdout: anyio.
                         json = session_message.message.model_dump_json(by_alias=True, exclude_unset=True)
                         await stdout.write(json + "\n")
                         await stdout.flush()
-            except anyio.ClosedResourceError:  # pragma: no cover
+            except anyio.ClosedResourceError:  # pragma: lax no cover - hit by any passing exception on POSIX
                 await anyio.lowlevel.checkpoint()
 
         async with anyio.create_task_group() as tg:
